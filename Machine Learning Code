@@ -44,7 +44,6 @@ y = bank_data[target].values  # raw counts
 pop = bank_data[pop_col].values  # population offset
 
 
-# -----------------------------------------------------------
 # This removes the population-scaling artifact that was driving the
 # inflated R² and the meaningless feature importances in the count model.
 X = X_raw.copy()
