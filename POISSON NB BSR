@@ -1,0 +1,167 @@
+"""POISSON CODE -MADE BY HARRISON MODIFIED BY SALAH FOR MAC"""
+#Imports
+import pandas as pd
+import statsmodels.api as sm
+import numpy as np
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import os
+
+
+#VIF
+def calculate_vif(X, label):
+    print(f"\n===== VIF ({label}) =====")
+    X_const = sm.add_constant(X, has_constant="add")
+
+    vif_data = pd.DataFrame({
+        "Variable": X_const.columns,
+        "VIF": [
+            variance_inflation_factor(X_const.values, i)
+            for i in range(X_const.shape[1])
+        ]
+    })
+
+    print(vif_data)
+
+
+#Backwards Stepwise NB
+def backward_stepwise_nb(y, X, nb_alpha=1.0, p_threshold=0.05):
+    variables = list(X.columns)
+
+    while True:
+        X_model = sm.add_constant(X[variables], has_constant="add")
+        model = sm.GLM(
+            y,
+            X_model,
+            family=sm.families.NegativeBinomial(alpha=nb_alpha)
+        ).fit()
+
+        pvals = model.pvalues.drop("const")
+        max_p = pvals.max()
+
+        if max_p > p_threshold:
+            remove_var = pvals.idxmax()
+            print(f"Removing {remove_var} (p = {max_p:.4f})")
+            variables.remove(remove_var)
+        else:
+            break
+
+    return model, variables
+
+
+#Load Data
+def run_models():
+
+    # --- Load Data ---
+    csv_path = os.path.join(
+        os.path.expanduser("~"),
+        "Documents",
+        "outside_40_min_tracts.csv",)     # CHANGE TO YOUR CSV TITLE IN SAME FOLDEr)
+    df = pd.read_csv(csv_path)
+
+    # --- Clean column names ---
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.replace(r"[^\w\s]", "_", regex=True)
+        .str.replace(r"\s+", "_", regex=True)
+        .str.lower()
+    )
+
+    # --- Dependent Variable ---             CHANGE LINE 80 TO DEP. VAR STRIPPED NAME
+    y = pd.to_numeric(df["census_tract_level_late_cases_number"], errors="coerce")
+
+    # --- Predictor candidates ---
+    predictors_all = [
+        col for col in df.columns
+        if col not in [                         # USE THIS SECTION TO EXCLUDE CERTAIN COLUMNS
+            "zip_code",
+            "Census_Tract_Incidence",
+        ]
+    ]
+
+    print("\nAvailable predictors:")
+    for i, col in enumerate(predictors_all, start=1):
+        print(f"{i}. {col}")
+
+    # --- User selection ---
+    while True:
+        choice = input("\nEnter predictor numbers separated by commas: ")
+        try:
+            idx = [int(c.strip()) - 1 for c in choice.split(",")]
+            if all(0 <= i < len(predictors_all) for i in idx):
+                break
+            else:
+                print("Selection out of range.")
+        except ValueError:
+            print("Invalid format. Use numbers separated by commas.")
+
+    predictors = [predictors_all[i] for i in idx]
+
+    print("\nSelected predictors:")
+    for p in predictors:
+        print(" -", p)
+
+    # --- Build X ---
+    X = df[predictors].apply(pd.to_numeric, errors="coerce")
+    X = X.replace([np.inf, -np.inf], np.nan)
+
+    df_clean = pd.concat([y, X], axis=1).dropna()                          # CHANGE LINE 119 and 120
+    y = df_clean["census_tract_level_late_cases_number"]                                         # TO YOUR DEP. VAR
+    X = df_clean.drop(columns=["census_tract_level_late_cases_number"])
+
+    X_const = sm.add_constant(X, has_constant="add")
+
+   #Poisson
+    poisson_model = sm.GLM(
+        y,
+        X_const,
+        family=sm.families.Poisson()
+    ).fit()
+
+    print("\n================ POISSON ================")
+    print(poisson_model.summary())
+
+    calculate_vif(X, "Poisson (Full Model)")
+
+    #Alpha and NB
+    nb_alpha_value = 1.0   # <-- YOU control dispersion here
+
+    nb_model = sm.GLM(
+        y,
+        X_const,
+        family=sm.families.NegativeBinomial(alpha=nb_alpha_value)
+    ).fit()
+
+    print("\n============ NEGATIVE BINOMIAL ============")
+    print(f"NB alpha (dispersion) set to: {nb_alpha_value}")
+    print(nb_model.summary())
+
+    calculate_vif(X, "Negative Binomial (Full Model)")
+
+   #Print NB
+    print("\n====== BACKWARD STEPWISE (NB) ======")
+
+    step_model, final_vars = backward_stepwise_nb(
+        y,
+        X,
+        nb_alpha=nb_alpha_value,
+        p_threshold=0.05
+    )
+
+    print("\nFinal variables retained:")
+    print(final_vars)
+
+    print("\nFinal stepwise model summary:")
+    print(step_model.summary())
+
+    calculate_vif(X[final_vars], "Backward Stepwise NB (Final Model)")
+
+
+#Loop function
+if __name__ == "__main__":
+    while True:
+        run_models()
+        again = input("\nRun again? (Y/N): ").strip().lower()
+        if again != "y":
+            print("Exiting.")
+            break
