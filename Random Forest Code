@@ -1,0 +1,222 @@
+# Base packages
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Poisson gradient boosting + diagnostics
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    mean_poisson_deviance,
+)
+from sklearn.model_selection import RandomizedSearchCV, train_test_split
+from sklearn.inspection import permutation_importance
+from scipy.stats import randint, uniform
+
+# Put your CSV file here (Mac default for path)
+bank_data = pd.read_csv("/Users/salah-eddinkomrokji/Documents/outside_40_min_tracts.csv")
+
+print("Shape:", bank_data.shape)
+print("Missing values:\n", bank_data.isna().sum()[bank_data.isna().sum() > 0])
+
+#Define target and population offset
+target = "census_tract_level_late_cases_number"
+pop_col = "Census_Tract_Population"
+
+# Drop ID column, the outcome, total incidence (downstream of outcome),
+# and population (which we'll use as the offset, not as a feature).
+drop_cols = [
+    "zip_code",
+    "Census_Tract_Incidence",
+    pop_col,
+    "Male_Population",
+    "Female_Population",
+    target,
+]
+
+# Remove tracts with zero population (would break the offset)
+bank_data = bank_data[bank_data[pop_col] > 0].copy()
+
+X_raw = bank_data.drop(columns=drop_cols)
+y = bank_data[target].values  # raw counts
+pop = bank_data[pop_col].values  # population offset
+
+
+# -----------------------------------------------------------
+# This removes the population-scaling artifact that was driving the
+# inflated R² and the meaningless feature importances in the count model.
+X = X_raw.copy()
+
+# Handle nulls AFTER converting to proportions
+X = X.fillna(X.median(numeric_only=True))
+
+
+# Train test split
+X_train, X_test, y_train, y_test, pop_train, pop_test = train_test_split(
+    X, y, pop, test_size=0.2, random_state=42
+)
+
+
+# Poisson Gradient and population offset
+
+rate_train = y_train / pop_train
+rate_test = y_test / pop_test
+
+hgb = HistGradientBoostingRegressor(
+    loss="poisson",
+    max_iter=500,
+    learning_rate=0.05,
+    max_depth=6,
+    min_samples_leaf=20,
+    l2_regularization=1.0,
+    random_state=42,
+)
+
+hgb.fit(X_train, rate_train, sample_weight=pop_train)
+
+
+# Diagnostics including MAE RMSE R2 and Poisson Metrics
+
+# Predict rates, multiply by population for expected counts
+pred_rate_test = hgb.predict(X_test)
+pred_count_test = pred_rate_test * pop_test
+
+pred_count_clipped = np.clip(pred_count_test, 1e-9, None)
+
+mae = mean_absolute_error(y_test, pred_count_test)
+rmse = np.sqrt(mean_squared_error(y_test, pred_count_test))
+r2 = r2_score(y_test, pred_count_test)
+dev = mean_poisson_deviance(y_test, pred_count_clipped)
+
+null_pred = np.full_like(y_test, y_train.mean(), dtype=float)
+null_dev = mean_poisson_deviance(y_test, np.clip(null_pred, 1e-9, None))
+pseudo_r2 = 1 - dev / null_dev
+
+print("\n--- Baseline Poisson GBM performance ---")
+print(f"MAE (counts)            : {mae:.3f}")
+print(f"RMSE (counts)           : {rmse:.3f}")
+print(f"R²  (counts, OLS-style) : {r2:.3f}")
+print(f"Poisson deviance        : {dev:.3f}")
+print(f"Pseudo-R² (deviance)    : {pseudo_r2:.3f}")
+
+# Hyperparameter Tuning and Settings
+param_dist = {
+    "max_iter": randint(200, 800),
+    "learning_rate": uniform(0.01, 0.15),
+    "max_depth": randint(3, 10),
+    "min_samples_leaf": randint(10, 50),
+    "l2_regularization": uniform(0.0, 5.0),
+}
+
+hgb_tune = HistGradientBoostingRegressor(loss="poisson", random_state=42)
+
+rand_search = RandomizedSearchCV(
+    hgb_tune,
+    param_distributions=param_dist,
+    n_iter=20,
+    cv=5,
+    scoring="neg_mean_poisson_deviance",
+    n_jobs=-1,
+    random_state=42,
+)
+
+rand_search.fit(X_train, rate_train, sample_weight=pop_train)
+best_hgb = rand_search.best_estimator_
+
+# Evaluate tuned model
+pred_rate_tuned = best_hgb.predict(X_test)
+pred_count_tuned = pred_rate_tuned * pop_test
+pred_count_tuned_clipped = np.clip(pred_count_tuned, 1e-9, None)
+
+mae_t = mean_absolute_error(y_test, pred_count_tuned)
+rmse_t = np.sqrt(mean_squared_error(y_test, pred_count_tuned))
+r2_t = r2_score(y_test, pred_count_tuned)
+dev_t = mean_poisson_deviance(y_test, pred_count_tuned_clipped)
+pseudo_r2_t = 1 - dev_t / null_dev
+
+print("\n--- Tuned Poisson GBM performance ---")
+print("Best params:", rand_search.best_params_)
+print(f"MAE (counts)            : {mae_t:.3f}")
+print(f"RMSE (counts)           : {rmse_t:.3f}")
+print(f"R²  (counts, OLS-style) : {r2_t:.3f}")
+print(f"Poisson deviance        : {dev_t:.3f}")
+print(f"Pseudo-R² (deviance)    : {pseudo_r2_t:.3f}")
+
+# Feature Importance Mapping
+perm = permutation_importance(
+    best_hgb,
+    X_test,
+    rate_test,
+    sample_weight=pop_test,
+    n_repeats=20,
+    random_state=42,
+    n_jobs=-1,
+    scoring="neg_mean_poisson_deviance",
+)
+
+label_map = {
+    "estimated_number_of_smokers": "Est. smokers",
+    "65_and_over": "Age 65+",
+    "Hispanic_or_latino": "Hispanic/Latino",
+    "White_alone": "White alone",
+    "Black_or_AA_Alone": "Black/AA alone",
+    "Asian_Alone": "Asian alone",
+    "Other_Alone": "Other race alone",
+    "Two_or_more_race": "Two+ races",
+    "Total_Insured": "Total insured",
+    "EstimatePublic_CoverageCOVERAGE_ALONEPublic_health_insurance_aloneMedicaidmeans_tested_coverage_alone":
+        "Medicaid only",
+    "25_and_over_9_to_12th__grade_no_high_school_diploma":
+        "No HS diploma (25+)",
+    "25_and_over_Highschool_or_equivalent":
+        "HS diploma (25+)",
+    "25_and_over_bachelors": "Bachelor's (25+)",
+    "25_and_over_graduate_degree": "Graduate degree (25+)",
+    "EstimateTotalPopulation_for_whom_poverty_status_is_determinedALL_INDIVIDUALS_WITH_INCOME_BELOW_THE_FOLLOWING_POVERTY_RATIOS50_percent_of_poverty_level": "Below 50% FPL",
+    "EstimateTotalPopulation_for_whom_poverty_status_is_determinedALL_INDIVIDUALS_WITH_INCOME_BELOW_THE_FOLLOWING_POVERTY_RATIOS125_percent_of_poverty_level": "Below 125% FPL",
+    "EstimateTotalPopulation_for_whom_poverty_status_is_determinedALL_INDIVIDUALS_WITH_INCOME_BELOW_THE_FOLLOWING_POVERTY_RATIOS150_percent_of_poverty_level": "Below 150% FPL",
+    "EstimateTotalPopulation_for_whom_poverty_status_is_determinedALL_INDIVIDUALS_WITH_INCOME_BELOW_THE_FOLLOWING_POVERTY_RATIOS185_percent_of_poverty_level": "Below 185% FPL",
+    "EstimateTotalPopulation_for_whom_poverty_status_is_determinedALL_INDIVIDUALS_WITH_INCOME_BELOW_THE_FOLLOWING_POVERTY_RATIOS200_percent_of_poverty_level": "Below 200% FPL",
+    "EstimateTotalPopulation_for_whom_poverty_status_is_determinedALL_INDIVIDUALS_WITH_INCOME_BELOW_THE_FOLLOWING_POVERTY_RATIOS300_percent_of_poverty_level": "Below 300% FPL",
+    "EstimateTotalPopulation_for_whom_poverty_status_is_determinedALL_INDIVIDUALS_WITH_INCOME_BELOW_THE_FOLLOWING_POVERTY_RATIOS400_percent_of_poverty_level": "Below 400% FPL",
+    "EstimateTotalPopulation_for_whom_poverty_status_is_determinedALL_INDIVIDUALS_WITH_INCOME_BELOW_THE_FOLLOWING_POVERTY_RATIOS500_percent_of_poverty_level": "Below 500% FPL",
+    "EstimateVEHICLES_AVAILABLEOccupied_housing_unitsNo_vehicles_available": "No vehicles",
+    "EstimateVEHICLES_AVAILABLEOccupied_housing_units1_vehicle_available": "1 vehicle",
+    "EstimateVEHICLES_AVAILABLEOccupied_housing_units2_vehicles_available": "2 vehicles",
+    "EstimateVEHICLES_AVAILABLEOccupied_housing_units3_or_more_vehicles_available": "3+ vehicles",
+}
+
+imp_df = (
+    pd.DataFrame({
+        "feature": X_train.columns,
+        "importance_mean": perm.importances_mean,
+        "importance_std": perm.importances_std,
+    })
+    .assign(feature=lambda d: d["feature"].map(label_map).fillna(d["feature"]))
+    .sort_values("importance_mean", ascending=False)
+)
+
+print("\n--- Permutation importance (top 15) ---")
+print(imp_df.head(15).to_string(index=False))
+
+# Plot
+top20 = imp_df.head(20).iloc[::-1]  # largest on top
+fig, ax = plt.subplots(figsize=(10, 8))
+ax.barh(top20["feature"], top20["importance_mean"], xerr=top20["importance_std"])
+ax.set_xlabel("Permutation importance (Δ Poisson deviance when shuffled)")
+ax.set_title("Top 20 Feature Importances — Poisson GBM (Late-Stage Cases)")
+plt.tight_layout()
+plt.show()
+
+#Predicted vs Actual Scatter Plot
+fig, ax = plt.subplots(figsize=(6, 6))
+ax.scatter(y_test, pred_count_tuned, alpha=0.4)
+mx = max(y_test.max(), pred_count_tuned.max())
+ax.plot([0, mx], [0, mx], "k--", linewidth=1)
+ax.set_xlabel("Observed late-stage cases")
+ax.set_ylabel("Predicted late-stage cases")
+ax.set_title("Predicted vs. observed (tuned Poisson GBM)")
+plt.tight_layout()
+plt.show()
